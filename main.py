@@ -97,22 +97,58 @@ def is_admin() -> bool:
 
 
 def load_config(config_path: str = None) -> dict:
-    """Load configuration from JSON file."""
-    if config_path is None:
-        config_path = Path(__file__).parent / "config.json"
+    """Load configuration with a dynamic path strategy.
+
+    Priority:
+    1) --config CLI argument (explicit path)
+    2) FPS_OVERLAY_CONFIG env var (explicit path)
+    3) Existing config.json in %APPDATA%/fps-overlay
+    4) Existing config.json next to the executable (frozen) or source (dev)
+    If none exist, we use %APPDATA%/fps-overlay/config.json as the default target for saves.
+    """
+    # 1) CLI-provided path
+    if config_path:
+        chosen_path = Path(config_path)
+    else:
+        # 2) Environment override
+        env_path = os.environ.get("FPS_OVERLAY_CONFIG")
+        if env_path:
+            chosen_path = Path(env_path)
+        else:
+            # Common base directories
+            appdata_dir = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "fps-overlay"
+            appdata_cfg = appdata_dir / "config.json"
+
+            # 3) Prefer existing config in AppData
+            if appdata_cfg.exists():
+                chosen_path = appdata_cfg
+            else:
+                # 4) Fallback to local directory
+                if getattr(sys, "frozen", False):
+                    base_dir = Path(sys.argv[0]).resolve().parent
+                else:
+                    base_dir = Path(__file__).parent
+                local_cfg = base_dir / "config.json"
+                if local_cfg.exists():
+                    chosen_path = local_cfg
+                else:
+                    # Default target for first-time save
+                    chosen_path = appdata_cfg
     
     config = {}
     
     try:
-        with open(config_path, 'r') as f:
+        with open(chosen_path, 'r') as f:
             config = json.load(f)
     except FileNotFoundError:
-        print(f"Config file not found: {config_path}")
+        print(f"Config file not found: {chosen_path}")
         print("Using default configuration.")
     except json.JSONDecodeError as e:
         print(f"Error parsing config file: {e}")
         print("Using default configuration.")
     
+    # Keep track of where the config came from for saving later
+    config["__config_path__"] = str(chosen_path)
     return config
 
 

@@ -3,9 +3,12 @@
     "position_y": 0,
     "update_interval": 1000,
     "background_opacity": 0.6,
-    "background_color": "20, 20, 20",
+    "background_color": "#141414",
     "text_color": "#B0B0B0",
-    "toggle_hotkey": "f11",
+    "text_opacity": 1.0,
+
+    "toggle_hotkey": "f12",
     "exit_hotkey": "ctrl+shift+q",
+    "settings_hotkey": "ctrl+alt+s",
     "show_full_device_names": false
 }

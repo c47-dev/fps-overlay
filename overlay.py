@@ -5,20 +5,28 @@ Uses PyQt6 with transparent, always-on-top, click-through window.
 
 import sys
 import threading
+import json
+import os
+from pathlib import Path
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-    QLabel, QGraphicsDropShadowEffect, QSystemTrayIcon, QMenu
+    QApplication, QWidget, QLabel, QVBoxLayout, QGraphicsDropShadowEffect,
+    QSystemTrayIcon, QMenu
 )
 from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal, QObject
-from PyQt6.QtGui import QColor, QFont, QMouseEvent, QIcon, QPixmap, QPainter, QAction
+from PyQt6.QtGui import (
+    QFont, QColor, QIcon, QPixmap, QPainter, QMouseEvent, QKeySequence,
+    QAction, QShortcut
+)
 
-from hardware_monitor import HardwareMonitor, HardwareStats
+from hardware_monitor import HardwareMonitor
+from settings_dialog import SettingsDialog
 
 
 class HotkeySignals(QObject):
     """Signals for hotkey events to communicate with Qt main thread."""
     toggle_signal = pyqtSignal()
     quit_signal = pyqtSignal()
+    settings_signal = pyqtSignal()
 
 
 class OverlayWidget(QWidget):
@@ -95,19 +103,39 @@ class OverlayWidget(QWidget):
         
         return label
     
+    def _resolve_rgba(self, color_value: str, opacity: float) -> str:
+        """Convert color string (hex or 'R, G, B') to rgba with opacity."""
+        try:
+            text = (color_value or "").strip()
+            if "," in text:
+                parts = [p.strip() for p in text.split(",")]
+                if len(parts) == 3:
+                    r, g, b = [max(0, min(255, int(p))) for p in parts]
+                    return f"rgba({r}, {g}, {b}, {opacity})"
+            qcolor = QColor(text)
+            if not qcolor.isValid():
+                qcolor = QColor("#141414")
+            return f"rgba({qcolor.red()}, {qcolor.green()}, {qcolor.blue()}, {opacity})"
+        except Exception:
+            return f"rgba(20, 20, 20, {opacity})"
+
     def apply_stylesheet(self):
         """Apply CSS styling to the overlay."""
-        bg_opacity = self.config.get('background_opacity', 0.7)
-        bg_color = self.config.get('background_color', '20, 20, 20')
-        text_color = self.config.get('text_color', '#00FF00')
+        bg_opacity = float(self.config.get('background_opacity', 0.7))
+        bg_color = self.config.get('background_color', '#141414')
+        text_color = self.config.get('text_color', '#B0B0B0')
+        text_opacity = float(self.config.get('text_opacity', 1.0))
+
+        bg_rgba = self._resolve_rgba(bg_color, bg_opacity)
+        text_rgba = self._resolve_rgba(text_color, text_opacity)
         
         self.setStyleSheet(f"""
             QWidget {{
-                background-color: rgba({bg_color}, {bg_opacity});
+                background-color: {bg_rgba};
                 border-radius: 8px;
             }}
             QLabel {{
-                color: {text_color};
+                color: {text_rgba};
                 padding: 2px 5px;
                 background: transparent;
             }}
@@ -123,23 +151,45 @@ class OverlayWidget(QWidget):
         
         # Initial update
         self.update_stats()
+
+    def update_config(self, new_config: dict):
+        """Update configuration and refresh overlay appearance/behavior."""
+        self.config = new_config or {}
+        # position
+        self.move(self.config.get('position_x', self.x()), self.config.get('position_y', self.y()))
+        # interval
+        interval = self.config.get('update_interval', 1000)
+        if hasattr(self, 'update_timer'):
+            self.update_timer.start(interval)
+        # stylesheet
+        self.apply_stylesheet()
+        # refresh display
+        self.update_stats()
     
     def get_temp_color(self, temp: float) -> str:
-        """Get color based on temperature (green->yellow->red)."""
+        """Get color based on temperature (green->yellow->red) with global text opacity."""
+        text_opacity = float(self.config.get('text_opacity', 1.0))
+        def rgba(hex_color: str) -> str:
+            try:
+                qc = QColor(hex_color)
+                if not qc.isValid():
+                    qc = QColor("#00FF00")
+                return f"rgba({qc.red()}, {qc.green()}, {qc.blue()}, {text_opacity})"
+            except Exception:
+                return f"rgba(0, 255, 0, {text_opacity})"
+
         if temp < 50:
-            return "#00FF00"  # Green - cool
+            return rgba("#00FF00")  # Green - cool
         elif temp < 70:
-            # Gradient from green to yellow (50-70)
             ratio = (temp - 50) / 20
             r = int(255 * ratio)
-            return f"#{r:02X}FF00"
+            return rgba(f"#{r:02X}FF00")
         elif temp < 85:
-            # Gradient from yellow to red (70-85)
             ratio = (temp - 70) / 15
             g = int(255 * (1 - ratio))
-            return f"#FF{g:02X}00"
+            return rgba(f"#FF{g:02X}00")
         else:
-            return "#FF0000"  # Red - hot
+            return rgba("#FF0000")  # Red - hot
     
     def update_stats(self):
         """Update displayed statistics."""
@@ -245,18 +295,41 @@ class OverlayApp:
         self.app.setQuitOnLastWindowClosed(False)
         
         self.config = config or {}
+        # Remember config path for saving
+        self.config_path = Path(self.config.get("__config_path__", Path(__file__).resolve().parent / "config.json"))
+        
         self.overlay = OverlayWidget(self.config)
+
+        # In-app Qt shortcuts (works even if keyboard module fails)
+        self._settings_shortcut = None
+        self.setup_qt_shortcuts()
         
         # Setup signals for thread-safe hotkey communication
         self.hotkey_signals = HotkeySignals()
         self.hotkey_signals.toggle_signal.connect(self.toggle_overlay)
         self.hotkey_signals.quit_signal.connect(self.quit)
+        self.hotkey_signals.settings_signal.connect(self.show_settings)
         
         # Setup system tray
         self.setup_tray()
         
         # Setup global hotkey
+        self.keyboard = None
+        self.keyboard_hotkeys_initialized = False
         self.setup_hotkey()
+
+    def setup_qt_shortcuts(self):
+        """Setup Qt-level shortcuts for settings (fallback when tray is hidden)."""
+        try:
+            settings_hotkey = self.config.get('settings_hotkey', 'ctrl+alt+s')
+            # If shortcut already exists, remove it
+            if self._settings_shortcut:
+                self._settings_shortcut.setParent(None)
+                self._settings_shortcut = None
+            self._settings_shortcut = QShortcut(QKeySequence(settings_hotkey), self.overlay)
+            self._settings_shortcut.activated.connect(self.show_settings)
+        except Exception as e:
+            print(f"Warning: Could not set Qt shortcut: {e}")
     
     def create_tray_icon(self) -> QIcon:
         """Create a simple colored icon for system tray."""
@@ -277,6 +350,10 @@ class OverlayApp:
         
         # Create tray menu
         tray_menu = QMenu()
+        
+        settings_action = QAction("Settings…", self.app)
+        settings_action.triggered.connect(self.show_settings)
+        tray_menu.addAction(settings_action)
         
         toggle_action = QAction("Toggle Overlay (F12)", self.app)
         toggle_action.triggered.connect(self.toggle_overlay)
@@ -299,11 +376,14 @@ class OverlayApp:
     
     def setup_hotkey(self):
         """Setup global hotkey for toggling overlay."""
-        self.hotkey_thread = None
-        
         try:
             import keyboard
-            
+            self.keyboard = keyboard
+
+            # If reloading, clear existing hotkeys
+            if self.keyboard_hotkeys_initialized:
+                keyboard.unhook_all_hotkeys()
+
             hotkey = self.config.get('toggle_hotkey', 'f12')
             exit_hotkey = self.config.get('exit_hotkey', 'ctrl+shift+q')
             
@@ -313,11 +393,18 @@ class OverlayApp:
             
             def on_quit():
                 self.hotkey_signals.quit_signal.emit()
+
+            def on_settings():
+                self.hotkey_signals.settings_signal.emit()
             
+            settings_hotkey = self.config.get('settings_hotkey', 'ctrl+alt+s')
+
             keyboard.add_hotkey(hotkey, on_toggle, suppress=False)
             keyboard.add_hotkey(exit_hotkey, on_quit, suppress=False)
+            keyboard.add_hotkey(settings_hotkey, on_settings, suppress=False)
             
-            print(f"Hotkeys registered: {hotkey} (toggle), {exit_hotkey} (exit)")
+            print(f"Hotkeys registered: {hotkey} (toggle), {exit_hotkey} (exit), {settings_hotkey} (settings)")
+            self.keyboard_hotkeys_initialized = True
             
         except ImportError:
             print("Warning: 'keyboard' module not available.")
@@ -326,6 +413,10 @@ class OverlayApp:
             print(f"Warning: Could not setup hotkeys: {e}")
             print("         Run as Administrator for hotkey support.")
             print("         Use system tray icon to control overlay.")
+
+    def reload_hotkeys(self):
+        """Reload global hotkeys after config changes."""
+        self.setup_hotkey()
     
     def toggle_overlay(self):
         """Toggle overlay visibility."""
@@ -337,8 +428,47 @@ class OverlayApp:
         if hasattr(self, 'tray_icon'):
             self.tray_icon.hide()
         self.app.quit()
+
+    def save_config(self, new_config: dict):
+        """Persist configuration to disk."""
+        target = Path(new_config.get("__config_path__", self.config_path))
+        fallback = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "fps-overlay" / "config.json"
+
+        def _try_write(path: Path) -> bool:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(new_config, f, indent=4)
+                self.config_path = path
+                self.config["__config_path__"] = str(path)
+                print(f"Config saved to {path}")
+                return True
+            except Exception as e:
+                print(f"Warning: Could not save config to {path}: {e}")
+                return False
+
+        if not _try_write(target):
+            if target != fallback:
+                if _try_write(fallback):
+                    new_config["__config_path__"] = str(fallback)
+                else:
+                    print("Warning: Failed to save config to both primary and fallback locations.")
+
+    def show_settings(self):
+        """Open settings dialog and apply changes."""
+        dialog = SettingsDialog(self.config, on_change=self.apply_live_settings)
+        dialog.exec()
     
     def run(self):
         """Run the application."""
         self.overlay.show()
         return self.app.exec()
+
+    def apply_live_settings(self, updated: dict):
+        """Apply settings immediately (live preview) and persist."""
+        # Preserve config path marker
+        updated["__config_path__"] = str(self.config_path)
+        self.config = updated
+        self.overlay.update_config(updated)
+        self.reload_hotkeys()
+        self.save_config(updated)
